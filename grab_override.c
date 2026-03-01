@@ -59,13 +59,6 @@ typedef struct {
 static screen_map_t screen_maps[MAX_SCREENS];
 static int num_screen_maps = 0;
 
-static int is_target_screen(int idx) {
-    if (num_targets == 0) return 1; /* all screens */
-    for (int i = 0; i < num_targets; i++)
-        if (target_screens[i] == idx) return 1;
-    return 0;
-}
-
 static void load_config(void) {
     if (config_loaded) return;
     config_loaded = 1;
