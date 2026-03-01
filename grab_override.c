@@ -12,17 +12,21 @@
 #include <stdarg.h>
 
 /*
- * LD_PRELOAD: fix Time Doctor black screenshots on KDE Plasma Wayland.
+ * LD_PRELOAD: fix black screenshots on KDE Plasma Wayland.
  *
  * Intercepts xcb_copy_area(root -> pixmap) and replaces black content
  * with a real screenshot taken via spectacle/portal.
  *
- * Optional: set GRAB_OVERRIDE_SCREEN=N to expose only screen N to TD.
- * This intercepts XRandR monitor enumeration so TD sees a single screen.
- * N is the 0-based monitor index (order as reported by xrandr).
+ * Optional: set GRAB_OVERRIDE_SCREEN to filter which monitors the app sees.
+ *   GRAB_OVERRIDE_SCREEN=0       - show only monitor 0
+ *   GRAB_OVERRIDE_SCREEN=0,2     - show monitors 0 and 2, hide the rest
+ *   (unset)                      - show all monitors (default)
+ *
+ * Monitor indices are 0-based, in the order reported by xrandr.
  */
 
 #define LOGFILE "/tmp/grab_override.log"
+#define MAX_SCREENS 16
 
 static void logmsg(const char *fmt, ...) {
     FILE *f = fopen(LOGFILE, "a");
@@ -41,22 +45,47 @@ static void logmsg(const char *fmt, ...) {
 
 /* ---- Configuration ---- */
 
-/* -1 = show all screens, >= 0 = show only screen N */
-static int target_screen = -1;
+static int target_screens[MAX_SCREENS];
+static int num_targets = 0;         /* 0 = show all */
 static int config_loaded = 0;
 
-/* Geometry of the selected screen (filled from XRandR data) */
-static int screen_x = 0, screen_y = 0;
-static int screen_w = 0, screen_h = 0;
-static int screen_geo_known = 0;
+/* Geometry of selected screens: virtual (x,y) -> real (x,y) mapping */
+typedef struct {
+    int real_x, real_y;
+    int virtual_x, virtual_y;
+    int w, h;
+} screen_map_t;
+
+static screen_map_t screen_maps[MAX_SCREENS];
+static int num_screen_maps = 0;
+
+static int is_target_screen(int idx) {
+    if (num_targets == 0) return 1; /* all screens */
+    for (int i = 0; i < num_targets; i++)
+        if (target_screens[i] == idx) return 1;
+    return 0;
+}
 
 static void load_config(void) {
     if (config_loaded) return;
     config_loaded = 1;
     const char *env = getenv("GRAB_OVERRIDE_SCREEN");
-    if (env) {
-        target_screen = atoi(env);
-        logmsg("GRAB_OVERRIDE_SCREEN=%d (single screen mode)", target_screen);
+    if (env && *env) {
+        char buf[256];
+        strncpy(buf, env, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *tok = strtok(buf, ",");
+        while (tok && num_targets < MAX_SCREENS) {
+            target_screens[num_targets++] = atoi(tok);
+            tok = strtok(NULL, ",");
+        }
+        char desc[256] = {0};
+        int off = 0;
+        for (int i = 0; i < num_targets; i++)
+            off += snprintf(desc + off, sizeof(desc) - off, "%s%d",
+                            i ? "," : "", target_screens[i]);
+        logmsg("GRAB_OVERRIDE_SCREEN=%s (%d screen%s)", desc, num_targets,
+                num_targets == 1 ? "" : "s");
     } else {
         logmsg("GRAB_OVERRIDE_SCREEN not set (all screens mode)");
     }
@@ -70,14 +99,6 @@ typedef xcb_void_cookie_t (*real_xcb_copy_area_t)(
 
 typedef xcb_randr_get_monitors_reply_t *(*real_xcb_randr_get_monitors_reply_t)(
     xcb_connection_t *, xcb_randr_get_monitors_cookie_t, xcb_generic_error_t **);
-
-typedef xcb_randr_get_screen_resources_current_reply_t *
-    (*real_xcb_randr_get_screen_resources_current_reply_t)(
-    xcb_connection_t *, xcb_randr_get_screen_resources_current_cookie_t,
-    xcb_generic_error_t **);
-
-typedef xcb_randr_get_crtc_info_reply_t *(*real_xcb_randr_get_crtc_info_reply_t)(
-    xcb_connection_t *, xcb_randr_get_crtc_info_cookie_t, xcb_generic_error_t **);
 
 static real_xcb_copy_area_t real_xcb_copy_area_fn = NULL;
 static real_xcb_randr_get_monitors_reply_t real_xcb_randr_get_monitors_reply_fn = NULL;
@@ -198,76 +219,119 @@ xcb_randr_get_monitors_reply(xcb_connection_t *c,
         real_xcb_randr_get_monitors_reply_fn(c, cookie, e);
 
     load_config();
-    if (!reply || target_screen < 0)
+    if (!reply || num_targets == 0)
         return reply;
 
-    /* Find the target monitor in the reply */
     int n = reply->nMonitors;
-    if (target_screen >= n) {
-        logmsg("WARN: GRAB_OVERRIDE_SCREEN=%d but only %d monitors, ignoring filter",
-                target_screen, n);
-        return reply;
-    }
 
+    /* Collect target monitors and compute virtual layout.
+     * Virtual layout: monitors placed left-to-right in the order listed
+     * in GRAB_OVERRIDE_SCREEN, with no gaps. */
+
+    /* First pass: gather all monitor infos */
+    xcb_randr_monitor_info_t *monitors[MAX_SCREENS];
     xcb_randr_monitor_info_iterator_t iter =
         xcb_randr_get_monitors_monitors_iterator(reply);
-
-    /* Advance to target monitor */
-    xcb_randr_monitor_info_t *target = NULL;
-    for (int i = 0; iter.rem; i++) {
-        if (i == target_screen) {
-            target = iter.data;
-            break;
-        }
+    for (int i = 0; i < n && i < MAX_SCREENS; i++) {
+        monitors[i] = iter.data;
         xcb_randr_monitor_info_next(&iter);
     }
 
-    if (!target) return reply;
+    /* Second pass: pick targets, compute sizes */
+    int kept = 0;
+    int total_outputs = 0;
+    int total_data_size = 0;
 
-    /* Save geometry for use in xcb_copy_area */
-    screen_x = target->x;
-    screen_y = target->y;
-    screen_w = target->width;
-    screen_h = target->height;
-    screen_geo_known = 1;
+    /* Temporary storage for selected monitors */
+    typedef struct {
+        xcb_randr_monitor_info_t *info;
+        int orig_idx;
+    } picked_t;
+    picked_t picked[MAX_SCREENS];
 
-    logmsg("Filtering monitors: keeping only #%d (%dx%d+%d+%d), hiding %d others",
-            target_screen, screen_w, screen_h, screen_x, screen_y, n - 1);
+    for (int i = 0; i < num_targets; i++) {
+        int idx = target_screens[i];
+        if (idx < 0 || idx >= n) {
+            logmsg("WARN: screen %d out of range (have %d), skipping", idx, n);
+            continue;
+        }
+        picked[kept].info = monitors[idx];
+        picked[kept].orig_idx = idx;
+        total_outputs += monitors[idx]->nOutput;
+        total_data_size += sizeof(xcb_randr_monitor_info_t) +
+                           monitors[idx]->nOutput * sizeof(xcb_randr_output_t);
+        kept++;
+    }
 
-    /* Build a new reply with only this one monitor.
-     * Monitor info is: fixed struct + nOutput * sizeof(xcb_randr_output_t) */
-    int outputs_size = target->nOutput * sizeof(xcb_randr_output_t);
-    int monitor_data_size = sizeof(xcb_randr_monitor_info_t) + outputs_size;
-    int new_reply_size = sizeof(xcb_randr_get_monitors_reply_t) + monitor_data_size;
+    if (kept == 0) return reply;
 
+    /* Build virtual layout: place monitors left-to-right */
+    num_screen_maps = 0;
+    int virtual_x = 0;
+    for (int i = 0; i < kept; i++) {
+        xcb_randr_monitor_info_t *m = picked[i].info;
+        screen_maps[num_screen_maps].real_x = m->x;
+        screen_maps[num_screen_maps].real_y = m->y;
+        screen_maps[num_screen_maps].virtual_x = virtual_x;
+        screen_maps[num_screen_maps].virtual_y = 0;
+        screen_maps[num_screen_maps].w = m->width;
+        screen_maps[num_screen_maps].h = m->height;
+
+        logmsg("Keeping monitor #%d (%dx%d+%d+%d) -> virtual +%d+0",
+                picked[i].orig_idx, m->width, m->height, m->x, m->y, virtual_x);
+
+        virtual_x += m->width;
+        num_screen_maps++;
+    }
+
+    logmsg("Filtered: %d -> %d monitors, hiding %d", n, kept, n - kept);
+
+    /* Build new reply */
+    int new_reply_size = sizeof(xcb_randr_get_monitors_reply_t) + total_data_size;
     xcb_randr_get_monitors_reply_t *filtered = calloc(1, new_reply_size);
     if (!filtered) return reply;
 
-    /* Copy header */
     memcpy(filtered, reply, sizeof(xcb_randr_get_monitors_reply_t));
-    filtered->nMonitors = 1;
-    filtered->nOutputs = target->nOutput;
-    filtered->length = (monitor_data_size + 3) / 4;
+    filtered->nMonitors = kept;
+    filtered->nOutputs = total_outputs;
+    filtered->length = (total_data_size + 3) / 4;
 
-    /* Copy the target monitor info + its outputs into the new reply.
-     * Move the monitor to position (0,0) so TD thinks it's the only screen. */
     uint8_t *dst = (uint8_t *)filtered + sizeof(xcb_randr_get_monitors_reply_t);
-    memcpy(dst, target, sizeof(xcb_randr_monitor_info_t));
 
-    xcb_randr_monitor_info_t *new_mon = (xcb_randr_monitor_info_t *)dst;
-    new_mon->x = 0;
-    new_mon->y = 0;
-    new_mon->primary = 1;
+    for (int i = 0; i < kept; i++) {
+        xcb_randr_monitor_info_t *m = picked[i].info;
+        int outputs_size = m->nOutput * sizeof(xcb_randr_output_t);
 
-    /* Copy output IDs */
-    xcb_randr_output_t *src_outputs = xcb_randr_monitor_info_outputs(target);
-    memcpy(dst + sizeof(xcb_randr_monitor_info_t), src_outputs, outputs_size);
+        /* Copy monitor info */
+        memcpy(dst, m, sizeof(xcb_randr_monitor_info_t));
+        xcb_randr_monitor_info_t *new_mon = (xcb_randr_monitor_info_t *)dst;
+        new_mon->x = screen_maps[i].virtual_x;
+        new_mon->y = screen_maps[i].virtual_y;
+        if (i == 0) new_mon->primary = 1;
+
+        /* Copy output IDs */
+        xcb_randr_output_t *src_outputs = xcb_randr_monitor_info_outputs(m);
+        memcpy(dst + sizeof(xcb_randr_monitor_info_t), src_outputs, outputs_size);
+
+        dst += sizeof(xcb_randr_monitor_info_t) + outputs_size;
+    }
 
     free(reply);
     return filtered;
 }
 
 /* ---- xcb_copy_area intercept ---- */
+
+/* Find the screen map entry that matches the given virtual coordinates */
+static screen_map_t *find_screen_map(int virt_x, int virt_y, int w, int h) {
+    for (int i = 0; i < num_screen_maps; i++) {
+        screen_map_t *sm = &screen_maps[i];
+        if (virt_x == sm->virtual_x && virt_y == sm->virtual_y &&
+            w == sm->w && h == sm->h)
+            return sm;
+    }
+    return NULL;
+}
 
 xcb_void_cookie_t
 xcb_copy_area(xcb_connection_t *c,
@@ -290,25 +354,28 @@ xcb_copy_area(xcb_connection_t *c,
 
     load_config();
 
-    /* Determine what region of the full screenshot to grab.
-     * In single-screen mode, TD sees a virtual screen at (0,0),
-     * but the real content is at (screen_x, screen_y) in the full screenshot. */
+    /* Determine real coordinates from virtual ones */
     int grab_x = src_x;
     int grab_y = src_y;
 
-    if (target_screen >= 0 && screen_geo_known) {
-        /* TD thinks the screen starts at (0,0), translate to real coords */
-        grab_x = screen_x + src_x;
-        grab_y = screen_y + src_y;
-        logmsg("xcb_copy_area from ROOT (single-screen mode): "
-                "virtual(%d,%d) -> real(%d,%d) %dx%d",
-                src_x, src_y, grab_x, grab_y, width, height);
+    if (num_targets > 0 && num_screen_maps > 0) {
+        screen_map_t *sm = find_screen_map(src_x, src_y, width, height);
+        if (sm) {
+            grab_x = sm->real_x;
+            grab_y = sm->real_y;
+            logmsg("xcb_copy_area from ROOT (filtered): "
+                    "virtual(%d,%d) -> real(%d,%d) %dx%d",
+                    src_x, src_y, grab_x, grab_y, width, height);
+        } else {
+            logmsg("xcb_copy_area from ROOT (filtered, no map match): "
+                    "src(%d,%d) %dx%d", src_x, src_y, width, height);
+        }
     } else {
         logmsg("xcb_copy_area from ROOT: src(%d,%d) dst(%d,%d) %dx%d",
                 src_x, src_y, dst_x, dst_y, width, height);
     }
 
-    /* Do the real copy first (will be black but needed for protocol) */
+    /* Do the real copy (black, but needed for protocol) */
     xcb_void_cookie_t cookie =
         real_xcb_copy_area_fn(c, src_drawable, dst_drawable, gc,
                                src_x, src_y, dst_x, dst_y,
@@ -338,7 +405,7 @@ xcb_copy_area(xcb_connection_t *c,
     xcb_screen_iterator_t iter = xcb_setup_roots_iterator(setup);
     uint8_t depth = iter.data ? iter.data->root_depth : 24;
 
-    /* Write to pixmap in chunks (xcb has max request size) */
+    /* Write to pixmap in chunks */
     uint32_t max_req = xcb_get_maximum_request_length(c);
     uint32_t max_data = (max_req * 4) - 64;
     int row_bytes = width * 4;
