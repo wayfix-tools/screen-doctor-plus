@@ -48,6 +48,10 @@ disappear. Monitor grabs in the same batch share one warning. If sending the
 notification fails, capture skips the five-second wait. The warning is off
 by default.
 
+Set `GRAB_OVERRIDE_SCREENSHOT_NOTICE_LABEL` to use a custom notification title.
+With a custom title, the notification sender is `Desktop Tools` and the icon
+is a generic information icon.
+
 ## Building
 
 ```bash
