@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 /*
  * LD_PRELOAD: fix black screenshots on KDE Plasma Wayland.
@@ -27,6 +28,7 @@
 
 #define LOGFILE "/tmp/grab_override.log"
 #define MAX_SCREENS 16
+#define SCREENSHOT_BATCH_GAP_NS 2000000000LL
 
 static void logmsg(const char *fmt, ...) {
     FILE *f = fopen(LOGFILE, "a");
@@ -48,6 +50,7 @@ static void logmsg(const char *fmt, ...) {
 static int target_screens[MAX_SCREENS];
 static int num_targets = 0;         /* 0 = show all */
 static int config_loaded = 0;
+static int screenshot_notice_enabled = 0;
 
 /* Geometry of selected screens: virtual (x,y) -> real (x,y) mapping */
 typedef struct {
@@ -62,6 +65,8 @@ static int num_screen_maps = 0;
 static void load_config(void) {
     if (config_loaded) return;
     config_loaded = 1;
+    const char *notice = getenv("GRAB_OVERRIDE_SCREENSHOT_NOTICE");
+    screenshot_notice_enabled = notice && strcmp(notice, "1") == 0;
     const char *env = getenv("GRAB_OVERRIDE_SCREEN");
     if (env && *env) {
         char buf[256];
@@ -107,6 +112,61 @@ static int is_root_window(xcb_connection_t *c, xcb_drawable_t drawable) {
         xcb_screen_next(&iter);
     }
     return 0;
+}
+
+typedef struct {
+    int x, y, width, height;
+} capture_area_t;
+
+static _Thread_local struct {
+    xcb_connection_t *connection;
+    int64_t last_capture_ns;
+    int count;
+    capture_area_t areas[MAX_SCREENS];
+} screenshot_batch;
+
+static int64_t monotonic_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (int64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+}
+
+static void warn_before_screenshot(xcb_connection_t *connection, capture_area_t area) {
+    /* Time Doctor grabs each monitor separately. Distinct areas requested in
+     * quick succession on the same connection share the first warning. */
+    int64_t now = monotonic_ns();
+    int same_batch = screenshot_batch.connection == connection &&
+                     screenshot_batch.last_capture_ns > 0 &&
+                     now >= screenshot_batch.last_capture_ns &&
+                     now - screenshot_batch.last_capture_ns < SCREENSHOT_BATCH_GAP_NS &&
+                     screenshot_batch.count < MAX_SCREENS;
+    for (int i = 0; same_batch && i < screenshot_batch.count; i++) {
+        capture_area_t previous = screenshot_batch.areas[i];
+        if (area.x == previous.x && area.y == previous.y &&
+            area.width == previous.width && area.height == previous.height)
+            same_batch = 0;
+    }
+    if (!same_batch) {
+        screenshot_batch.connection = connection;
+        screenshot_batch.count = 0;
+    }
+    screenshot_batch.areas[screenshot_batch.count++] = area;
+    if (same_batch) return;
+
+    /* Close the popup explicitly in case hovering pauses its timeout.
+     * Give Plasma the remaining two seconds to finish hiding it. */
+    int status = system("exec 2>/dev/null; unset LD_PRELOAD LD_LIBRARY_PATH; "
+                        "command -v gdbus >/dev/null || exit 1; "
+                        "notice_id=$(timeout 2s notify-send --print-id "
+                        "--app-name='Time Doctor' --icon=camera-photo --transient "
+                        "--expire-time=4500 'Screenshot in 5 seconds') || exit 1; "
+                        "sleep 3; "
+                        "timeout 1s gdbus call --session --dest org.freedesktop.Notifications "
+                        "--object-path /org/freedesktop/Notifications "
+                        "--method org.freedesktop.Notifications.CloseNotification \"$notice_id\" >/dev/null; "
+                        "close_status=$?; sleep 2; exit \"$close_status\"");
+    if (status != 0)
+        logmsg("Screenshot warning could not be sent or closed");
 }
 
 static int take_screenshot(const char *output_path) {
@@ -368,6 +428,9 @@ xcb_copy_area(xcb_connection_t *c,
                 src_x, src_y, dst_x, dst_y, width, height);
     }
 
+    if (screenshot_notice_enabled)
+        warn_before_screenshot(c, (capture_area_t){src_x, src_y, width, height});
+
     /* Do the real copy (black, but needed for protocol) */
     xcb_void_cookie_t cookie =
         real_xcb_copy_area_fn(c, src_drawable, dst_drawable, gc,
@@ -378,7 +441,10 @@ xcb_copy_area(xcb_connection_t *c,
     char tmppath[256];
     snprintf(tmppath, sizeof(tmppath), "/tmp/td_grab_%d.png", getpid());
 
-    if (take_screenshot(tmppath) != 0) {
+    int result = take_screenshot(tmppath);
+    if (screenshot_notice_enabled)
+        screenshot_batch.last_capture_ns = monotonic_ns();
+    if (result != 0) {
         logmsg("Screenshot failed");
         return cookie;
     }

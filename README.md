@@ -38,6 +38,16 @@ Usage: GRAB_OVERRIDE_SCREEN=0      - show only monitor #0
 Exec=env QT_QPA_PLATFORM=xcb GRAB_OVERRIDE_SCREEN=0 LD_PRELOAD=/path/to/grab_override.so /path/to/app
 ```
 
+## Screenshot warning
+
+Set `GRAB_OVERRIDE_SCREENSHOT_NOTICE=1` in the launcher to show a desktop
+notification and pause for five seconds before capturing. This requires
+`notify-send`, `gdbus`, and `timeout`. The hook closes the notification after
+three seconds and waits another two seconds before capture so the popup can
+disappear. Monitor grabs in the same batch share one warning. If sending the
+notification fails, capture skips the five-second wait. The warning is off
+by default.
+
 ## Building
 
 ```bash
